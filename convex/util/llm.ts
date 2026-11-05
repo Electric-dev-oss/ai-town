@@ -147,7 +147,7 @@ export async function chatCompletion(
     retries,
     ms,
   } = await retryWithBackoff(async () => {
-    const result = await fetch(config.url + '/v1/chat/completions', {
+    const result = await safeFetch(config.url + '/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -157,7 +157,7 @@ export async function chatCompletion(
       body: JSON.stringify(body),
     });
     if (!result.ok) {
-      const error = await result.text();
+      const error = redactSensitive(await result.text());
       console.error({ error });
       if (result.status === 404 && config.provider === 'ollama') {
         await tryPullOllama(body.model!, error);
@@ -190,15 +190,18 @@ export async function chatCompletion(
 export async function tryPullOllama(model: string, error: string) {
   if (error.includes('try pulling')) {
     console.error('Embedding model not found, pulling from Ollama');
-    const pullResp = await fetch(getLLMConfig().url + '/api/pull', {
+    const pullResp = await safeFetch(getLLMConfig().url + '/api/pull', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ name: model }),
     });
-    console.log('Pull response', await pullResp.text());
-    throw { retry: true, error: `Dynamically pulled model. Original error: ${error}` };
+    console.log('Pull response', redactSensitive(await pullResp.text()));
+    throw {
+      retry: true,
+      error: `Dynamically pulled model. Original error: ${redactSensitive(error)}`,
+    };
   }
 }
 
@@ -217,7 +220,7 @@ export async function fetchEmbeddingBatch(texts: string[]) {
     retries,
     ms,
   } = await retryWithBackoff(async () => {
-    const result = await fetch(config.url + '/v1/embeddings', {
+    const result = await safeFetch(config.url + '/v1/embeddings', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -232,7 +235,9 @@ export async function fetchEmbeddingBatch(texts: string[]) {
     if (!result.ok) {
       throw {
         retry: result.status === 429 || result.status >= 500,
-        error: new Error(`Embedding failed with code ${result.status}: ${await result.text()}`),
+        error: new Error(
+          `Embedding failed with code ${result.status}: ${redactSensitive(await result.text())}`,
+        ),
       };
     }
     return (await result.json()) as CreateEmbeddingResponse;
@@ -259,7 +264,7 @@ export async function fetchEmbedding(text: string) {
 
 export async function fetchModeration(content: string) {
   const { result: flagged } = await retryWithBackoff(async () => {
-    const result = await fetch(getLLMConfig().url + '/v1/moderations', {
+    const result = await safeFetch(getLLMConfig().url + '/v1/moderations', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -273,7 +278,9 @@ export async function fetchModeration(content: string) {
     if (!result.ok) {
       throw {
         retry: result.status === 429 || result.status >= 500,
-        error: new Error(`Embedding failed with code ${result.status}: ${await result.text()}`),
+        error: new Error(
+          `Embedding failed with code ${result.status}: ${redactSensitive(await result.text())}`,
+        ),
       };
     }
     return (await result.json()) as { results: { flagged: boolean }[] };
@@ -688,7 +695,7 @@ export class ChatCompletionContent {
 export async function ollamaFetchEmbedding(text: string) {
   const config = getLLMConfig();
   const { result } = await retryWithBackoff(async () => {
-    const resp = await fetch(config.url + '/api/embeddings', {
+    const resp = await safeFetch(config.url + '/api/embeddings', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -696,11 +703,100 @@ export async function ollamaFetchEmbedding(text: string) {
       body: JSON.stringify({ model: config.embeddingModel, prompt: text }),
     });
     if (resp.status === 404) {
-      const error = await resp.text();
+      const error = redactSensitive(await resp.text());
       await tryPullOllama(config.embeddingModel, error);
       throw new Error(`Failed to fetch embeddings: ${resp.status}`);
     }
     return (await resp.json()).embedding as number[];
   });
   return { embedding: result };
+}
+
+const SAFE_BRAIN_CHARACTER = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+// Hide proxy path prefixes, URL userinfo, query strings, and bearer tokens in errors.
+export function redactSensitive(value: string): string {
+  let out = value;
+  const base = process.env.OLLAMA_HOST;
+  if (base) {
+    const trimmed = base.replace(/\/+$/, '');
+    out = out.split(base).join(redactUrl(trimmed));
+    if (trimmed !== base) {
+      out = out.split(trimmed).join(redactUrl(trimmed));
+    }
+    const segment = firstPathSegment(trimmed);
+    if (segment && segment.length >= 8 && segment !== 'localhost') {
+      out = out.split(segment).join('<redacted>');
+    }
+  }
+  out = out.replace(/Bearer\s+\S+/gi, 'Bearer <redacted>');
+  out = out.replace(/https?:\/\/[^\s)'"]+/g, (url) => redactUrl(url));
+  return out;
+}
+
+function firstPathSegment(url: string): string | null {
+  try {
+    const segment = new URL(url).pathname.split('/').filter(Boolean)[0];
+    return segment ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function redactUrl(url: string): string {
+  const noUser = url.replace(/^(https?:\/\/)[^/@\s]+@/, '$1');
+  const noQuery = noUser.replace(/[?#].*$/, '');
+  return noQuery.replace(/^(https?:\/\/[^/]+)\/[^/]+(.*)$/, '$1/<redacted>$2');
+}
+
+async function safeFetch(input: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    throw new Error(`LLM fetch failed (${redactSensitive(input)}): ${redactSensitive(message)}`);
+  }
+}
+
+// External town voice. Returns null when OLLAMA_HOST is unset, so the caller keeps the town LLM.
+export async function brainTownReply(
+  char: string,
+  payload: {
+    me: string;
+    other: string;
+    kind: 'start' | 'continue' | 'leave';
+    history: { from: string; text: string }[];
+  },
+  ms: number,
+): Promise<string | null> {
+  const base = process.env.OLLAMA_HOST?.replace(/\/+$/, '');
+  if (!base) {
+    return null;
+  }
+  if (!SAFE_BRAIN_CHARACTER.test(char)) {
+    return null;
+  }
+  const timeoutMs = Number.isFinite(ms) ? Math.min(120_000, Math.max(1, ms)) : 60_000;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const response = await safeFetch(`${base}/${char}/town_reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+      redirect: 'error',
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const body: unknown = await response.json();
+    if (!body || typeof body !== 'object' || !('text' in body)) {
+      return null;
+    }
+    const text = (body as { text: unknown }).text;
+    return typeof text === 'string' && text.trim() ? text.trim() : null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
