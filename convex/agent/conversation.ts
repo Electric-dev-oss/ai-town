@@ -1,7 +1,7 @@
 import { v } from 'convex/values';
 import { Id } from '../_generated/dataModel';
 import { ActionCtx, internalQuery } from '../_generated/server';
-import { LLMMessage, chatCompletion } from '../util/llm';
+import { LLMMessage, brainTownReply, chatCompletion } from '../util/llm';
 import * as memory from './memory';
 import { api, internal } from '../_generated/api';
 import * as embeddingsCache from './embeddingsCache';
@@ -10,6 +10,68 @@ import { NUM_MEMORIES_TO_SEARCH } from '../constants';
 
 const selfInternal = internal.agent.conversation;
 
+// Optional external brain. An unset or empty BRAIN_TOWN leaves chatCompletion unchanged.
+export function brainTownAllowList(): string[] {
+  return (process.env.BRAIN_TOWN ?? '')
+    .toLowerCase()
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
+export async function tryBrain(
+  ctx: ActionCtx,
+  worldId: Id<'worlds'>,
+  conversationId: GameId<'conversations'>,
+  playerId: GameId<'players'>,
+  otherPlayerId: GameId<'players'>,
+  kind: 'start' | 'continue' | 'leave',
+): Promise<string | null> {
+  const allowed = brainTownAllowList();
+  if (allowed.length === 0) {
+    return null;
+  }
+  const started = Date.now();
+  let who = '?';
+  try {
+    const { player, otherPlayer } = await ctx.runQuery(selfInternal.queryPromptData, {
+      worldId,
+      playerId,
+      otherPlayerId,
+      conversationId,
+    });
+    who = player.name;
+    if (!allowed.includes(who.toLowerCase())) {
+      return null;
+    }
+    const messages = await ctx.runQuery(api.messages.listMessages, { worldId, conversationId });
+    const history = messages.slice(-6).map((message) => ({
+      from: message.author === player.id ? player.name : otherPlayer.name,
+      text: String(message.text ?? '').slice(0, 500),
+    }));
+    const text = await brainTownReply(
+      who.toLowerCase(),
+      { me: player.name, other: otherPlayer.name, kind, history },
+      Number(process.env.BRAIN_TOWN_MS) || 60000,
+    );
+    if (text) {
+      console.log(`[BRAIN_TOWN] src=brain char=${who} kind=${kind} ms=${Date.now() - started}`);
+      return text;
+    }
+    console.log(
+      `[BRAIN_TOWN] src=fallback char=${who} kind=${kind} ms=${Date.now() - started} reason=no_text`,
+    );
+  } catch (e: unknown) {
+    if (allowed.includes(who.toLowerCase())) {
+      const reason = e instanceof Error ? e.name : 'error';
+      console.log(
+        `[BRAIN_TOWN] src=fallback char=${who} kind=${kind} ms=${Date.now() - started} reason=${reason}`,
+      );
+    }
+  }
+  return null;
+}
+
 export async function startConversationMessage(
   ctx: ActionCtx,
   worldId: Id<'worlds'>,
@@ -17,6 +79,10 @@ export async function startConversationMessage(
   playerId: GameId<'players'>,
   otherPlayerId: GameId<'players'>,
 ): Promise<string> {
+  const brainLine = await tryBrain(ctx, worldId, conversationId, playerId, otherPlayerId, 'start');
+  if (brainLine) {
+    return brainLine;
+  }
   const { player, otherPlayer, agent, otherAgent, lastConversation } = await ctx.runQuery(
     selfInternal.queryPromptData,
     {
@@ -84,6 +150,17 @@ export async function continueConversationMessage(
   playerId: GameId<'players'>,
   otherPlayerId: GameId<'players'>,
 ): Promise<string> {
+  const brainLine = await tryBrain(
+    ctx,
+    worldId,
+    conversationId,
+    playerId,
+    otherPlayerId,
+    'continue',
+  );
+  if (brainLine) {
+    return brainLine;
+  }
   const { player, otherPlayer, conversation, agent, otherAgent } = await ctx.runQuery(
     selfInternal.queryPromptData,
     {
@@ -143,6 +220,10 @@ export async function leaveConversationMessage(
   playerId: GameId<'players'>,
   otherPlayerId: GameId<'players'>,
 ): Promise<string> {
+  const brainLine = await tryBrain(ctx, worldId, conversationId, playerId, otherPlayerId, 'leave');
+  if (brainLine) {
+    return brainLine;
+  }
   const { player, otherPlayer, conversation, agent, otherAgent } = await ctx.runQuery(
     selfInternal.queryPromptData,
     {

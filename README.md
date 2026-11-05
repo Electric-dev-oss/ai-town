@@ -261,10 +261,32 @@ vector database must match the embedding model's dimension. See
 
 ## Customize your own simulation
 
-NOTE: every time you change character data, you should re-run `npx convex run testing:wipeAllTables`
-and then `npm run dev` to re-upload everything to Convex. This is because character data is sent to
-Convex on the initial load. However, beware that `npx convex run testing:wipeAllTables` WILL wipe
-all of your data.
+NOTE: character descriptions are copied into Convex when an agent is created. Changing
+`data/characters.ts` does not by itself rewrite or delete agents already stored in a world.
+`npx convex run testing:wipeAllTables` deletes that stored data. Install, `init`, and
+`addNamedAgent` do not run it.
+
+### Stormvale characters and optional brains
+
+`data/characters.ts` lists seven family characters: Jolt, Lyra, Enrique, Mira, Elian Marlowe, Demon
+Outlaw, and Erebus Stormvale. They use the existing folk sprites. Nothing in this repository wipes a
+live world to install them. `init` still creates agents only when the world has none. To add one
+description to a world that already has agents, run the internal mutation `addNamedAgent:add` with
+that `worldId` and a `descriptionIndex`. It only enqueues `createAgent`.
+
+Per-character lines are optional and off by default. Set Convex `BRAIN_TOWN` to a comma-separated
+list of lowercase names, such as `lyra,jolt`, to ask an external town-voice service. Leave it unset
+and conversation start, continue, and leave keep the ordinary `chatCompletion` call, including
+`max_tokens: 300`. A disabled, empty, or failed external call falls back to that same path.
+`OLLAMA_HOST` must be set before a brain route is attempted; when it is unset, `brainTownReply` does
+not fetch.
+
+This repository does not include a `brain.py`, persona file, or memory store for any character.
+`services/town_voice/town_voice.py` loads that module at runtime from
+`BOX_BRAINS_ROOT/<character>/`. The contract is
+[`services/town_voice/BRAIN_MODULE_CONTRACT.md`](./services/town_voice/BRAIN_MODULE_CONTRACT.md).
+The optional proxy defaults to loopback routes for `lyra` and `jolt` only. The other five characters
+have descriptions here and no bundled brain or default proxy route.
 
 1. Create your own characters and stories: All characters and stories, as well as their spritesheet
    references are stored in [characters.ts](./data/characters.ts). You can start by changing

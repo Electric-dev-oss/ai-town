@@ -42,3 +42,9 @@ dist
 
 convex-local*
 convex_local*
+
+# Optional local brain runtimes and town-voice logs. Never commit these.
+services/brains/
+*_town.log
+__pycache__/
+*.py[cod]
